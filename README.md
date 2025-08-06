@@ -1,90 +1,60 @@
 # Triverge Vault Contract
 
-This Clarity smart contract implements a risk-based vault system for the Stacks blockchain, allowing users to deposit STX tokens into vaults with different risk profiles and earn yield after a lock period.
+A secure, role-based vault system for the Stacks blockchain with enhanced security features and analytics.
 
----
+## New Security Features
 
-## Features
+- **Role-Based Access Control (RBAC)**
+- **Contract Pause Mechanism**
+- **Deposit Limits**
+- **Input Validation**
+- **Emergency Controls**
 
-- **Vault Creation:** Admin can create vaults with specified risk type and lock period.
-- **Deposits:** Users can deposit STX into a vault (one deposit per user per vault).
-- **Withdrawals:** Users can withdraw their deposit plus yield after the lock period.
-- **Yield Calculation:** Yield rates depend on vault risk type (2%, 5%, or 10%).
-- **Admin Controls:** Admin can rebalance vault yields and change admin address.
-- **Read-Only Queries:** Functions to get vault details, user deposits, admin address, vault counter, withdrawal eligibility, expected yield, and vault type name.
+## Core Features
 
----
+- **Vault Creation:** Admin/operators can create vaults with risk types and lock periods
+- **Deposits:** Users can deposit STX (with deposit caps)
+- **Withdrawals:** Time-locked withdrawals with yield
+- **Yield Calculation:** Risk-based yields (2%, 5%, 10%)
+- **Analytics:** Comprehensive vault and contract statistics
 
-## Vault Types & Yield Rates
+## Roles & Permissions
 
-| Type   | Constant      | Yield Rate |
-|--------|---------------|------------|
-| LOW    | `VAULT_LOW`   | 2%         |
-| MEDIUM | `VAULT_MEDIUM`| 5%         |
-| HIGH   | `VAULT_HIGH`  | 10%        |
+| Role      | Access Level | Capabilities |
+|-----------|--------------|--------------|
+| ADMIN     | Full        | All functions + emergency controls |
+| OPERATOR  | Limited     | Vault creation + yield management |
+| USER      | Basic       | Deposits + withdrawals |
 
----
+## Security Controls
 
-## Usage
-
-### 1. Create a Vault (Admin Only)
 ```clarity
-(create-vault vault-type lock-period)
+max-deposit-per-user: u1000000000  // 1000 STX
+max-vault-capacity:   u10000000000  // 10000 STX
+contract-paused:      bool          // Emergency pause
 ```
-- `vault-type`: `u1` (LOW), `u2` (MEDIUM), `u3` (HIGH)
-- `lock-period`: Number of blocks funds are locked
 
-### 2. Deposit STX
+## New Functions
+
+### Administrative
 ```clarity
-(deposit vault-id amount)
+(grant-role user role)
+(revoke-role user)
+(set-contract-paused paused)
+(set-deposit-limits max-per-user max-vault)
+(fund-contract amount)
+(emergency-withdraw amount)
 ```
-- `vault-id`: Vault identifier
-- `amount`: Amount of STX to deposit
 
-### 3. Withdraw Funds
+### Analytics
 ```clarity
-(withdraw vault-id)
+(get-user-role user)
+(is-contract-paused)
+(get-deposit-limits)
+(get-contract-balance)
+(get-vault-analytics vault-id)
+(get-contract-stats)
 ```
-- Withdraws deposit plus yield after lock period
-
-### 4. Rebalance Vault Yield (Admin Only)
-```clarity
-(rebalance-yields vault-id additional-yield)
-```
-- Adds additional yield to a vault
-
-### 5. Change Admin (Admin Only)
-```clarity
-(change-admin new-admin)
-```
-- Sets a new admin principal
-
----
-
-## Read-Only Functions
-
-- **Get Vault Details:**  
-  `(get-vault vault-id)`
-
-- **Get User Deposit:**  
-  `(get-deposit user vault-id)`
-
-- **Get Admin Address:**  
-  `(get-admin)`
-
-- **Get Vault Counter:**  
-  `(get-vault-counter)`
-
-- **Check Withdrawal Eligibility:**  
-  `(can-withdraw user vault-id)`
-
-- **Get Expected Yield:**  
-  `(get-expected-yield vault-id amount)`
-
-- **Get Vault Type Name:**  
-  `(get-vault-type-name vault-type)`
-
----
 
 ## Error Codes
 
@@ -98,17 +68,42 @@ This Clarity smart contract implements a risk-based vault system for the Stacks 
 | 105  | Invalid amount            |
 | 106  | Transfer failed           |
 | 107  | Already deposited         |
+| 108  | Contract paused           |
+| 109  | Deposit cap exceeded      |
+| 110  | Invalid role             |
+| 111  | Invalid principal        |
 
----
+## Validation Constants
 
-## Notes
+```clarity
+MAX_VAULT_ID:     u1000000
+MAX_AMOUNT:       u1000000000000  // 1M STX
+MIN_LOCK_PERIOD:  u1
+MAX_LOCK_PERIOD:  u52560          // ~1 year
+```
 
-- Only one deposit per user per vault is allowed.
-- Withdrawals are only possible after the lock period.
-- Admin is set to the contract deployer by default.
+## Security Notes
 
----
+- Input validation on all functions
+- Role-based access control
+- Deposit caps per user and vault
+- Emergency pause mechanism
+- Protected admin functions
+- Safe transfer patterns
+- Principal validation
+
+## Contract Analytics
+
+- Vault utilization rates
+- Total deposits and yields
+- Contract balance monitoring
+- Vault performance metrics
+- User activity tracking
 
 ## License
 
-MIT License (or specify your own)
+MIT License
+
+---
+
+For detailed implementation and usage examples, see the contract documentation.
