@@ -13,6 +13,8 @@
 (define-constant ERR_DEPOSIT_CAP_EXCEEDED u109)
 (define-constant ERR_INVALID_ROLE u110)
 (define-constant ERR_INVALID_PRINCIPAL u111)
+(define-constant ERR_INSUFFICIENT_YIELD_RESERVES u112)
+(define-constant ERR_WITHDRAWAL_QUEUE_FULL u113)
 
 ;; Vault risk types
 (define-constant VAULT_LOW u1)
@@ -28,6 +30,7 @@
 (define-constant MAX_AMOUNT u1000000000000) ;; 1M STX in microSTX
 (define-constant MIN_LOCK_PERIOD u1)
 (define-constant MAX_LOCK_PERIOD u52560) ;; ~1 year in blocks
+(define-constant MAX_WITHDRAWAL_QUEUE u100) ;; Maximum pending withdrawals
 
 ;; Admin (kept for backward compatibility)
 (define-data-var admin principal tx-sender)
@@ -36,6 +39,12 @@
 (define-data-var contract-paused bool false)
 (define-data-var max-deposit-per-user uint u1000000000) ;; 1000 STX in microSTX
 (define-data-var max-vault-capacity uint u10000000000) ;; 10000 STX in microSTX
+
+;; Fund management variables
+(define-data-var total-yield-reserves uint u0) ;; Total funds allocated for yield payments
+(define-data-var total-pending-yields uint u0) ;; Total yields owed to users
+(define-data-var withdrawal-queue-count uint u0) ;; Number of pending withdrawals
+(define-data-var emergency-reserve-ratio uint u10) ;; 10% emergency reserve requirement
 
 ;; Role-based access control
 (define-map user-roles
@@ -61,6 +70,26 @@
     amount: uint,
     deposit-block: uint,
     claimed: bool
+  }
+)
+
+;; Withdrawal queue for fund management
+(define-map withdrawal-queue
+  { user: principal, vault-id: uint }
+  {
+    amount: uint,
+    yield: uint,
+    total: uint,
+    queued-block: uint
+  }
+)
+
+;; Fund management tracking
+(define-map vault-reserves
+  { vault-id: uint }
+  {
+    allocated-reserves: uint,
+    pending-yields: uint
   }
 )
 
@@ -136,6 +165,47 @@
           (is-eq vault-type VAULT_HIGH)))
 )
 
+;; === Fund Management Helper Functions ===
+
+(define-private (calculate-required-reserves (vault-id uint))
+  (match (map-get? vaults { id: vault-id })
+    vault-data
+    (let ((total-deposits (get total-deposit vault-data))
+          (vault-type (get vault-type vault-data)))
+      (let ((yield-rate (if (is-eq vault-type VAULT_LOW)
+                           u2
+                           (if (is-eq vault-type VAULT_MEDIUM)
+                               u5
+                               u10))))
+        (/ (* total-deposits yield-rate) u100)
+      )
+    )
+    u0
+  )
+)
+
+(define-private (update-vault-reserves (vault-id uint) (deposit-amount uint))
+  (let ((required-yield (calculate-yield vault-id deposit-amount))
+        (current-reserves (default-to { allocated-reserves: u0, pending-yields: u0 }
+                                     (map-get? vault-reserves { vault-id: vault-id }))))
+    (map-set vault-reserves
+      { vault-id: vault-id }
+      {
+        allocated-reserves: (+ (get allocated-reserves current-reserves) required-yield),
+        pending-yields: (+ (get pending-yields current-reserves) required-yield)
+      }
+    )
+    (var-set total-pending-yields (+ (var-get total-pending-yields) required-yield))
+  )
+)
+
+(define-private (check-fund-sufficiency (total-amount uint))
+  (let ((contract-balance (stx-get-balance (as-contract tx-sender)))
+        (emergency-reserve (/ (* contract-balance (var-get emergency-reserve-ratio)) u100)))
+    (>= contract-balance (+ total-amount emergency-reserve))
+  )
+)
+
 ;; === Security Management Functions ===
 
 ;; Grant role (admin only) - with input validation
@@ -183,25 +253,46 @@
   )
 )
 
-;; Fund contract for yield payments (admin only) - with input validation
+;; Enhanced fund contract for yield payments with reserve tracking
 (define-public (fund-contract (amount uint))
   (begin
     (asserts! (is-valid-amount amount) (err ERR_INVALID_AMOUNT))
     (asserts! (has-role tx-sender ROLE_ADMIN) (err ERR_UNAUTHORIZED))
     (let ((validated-amount (sanitize-amount amount)))
-      (stx-transfer? validated-amount tx-sender (as-contract tx-sender))
+      (match (stx-transfer? validated-amount tx-sender (as-contract tx-sender))
+        success
+        (begin
+          (var-set total-yield-reserves (+ (var-get total-yield-reserves) validated-amount))
+          (ok true)
+        )
+        error (err ERR_TRANSFER_FAILED)
+      )
     )
   )
 )
 
-;; Emergency withdrawal for admin - with input validation
+;; Emergency withdrawal for admin - with input validation and reserve protection
 (define-public (emergency-withdraw (amount uint))
   (begin
     (asserts! (is-valid-amount amount) (err ERR_INVALID_AMOUNT))
     (asserts! (has-role tx-sender ROLE_ADMIN) (err ERR_UNAUTHORIZED))
-    (let ((validated-amount (sanitize-amount amount)))
+    (let ((validated-amount (sanitize-amount amount))
+          (contract-balance (stx-get-balance (as-contract tx-sender)))
+          (required-reserves (var-get total-pending-yields)))
+      ;; Ensure we don't withdraw funds needed for user yields
+      (asserts! (>= (- contract-balance validated-amount) required-reserves) (err ERR_INSUFFICIENT_YIELD_RESERVES))
       (as-contract (stx-transfer? validated-amount tx-sender tx-sender))
     )
+  )
+)
+
+;; Set emergency reserve ratio (admin only)
+(define-public (set-emergency-reserve-ratio (ratio uint))
+  (begin
+    (asserts! (<= ratio u50) (err ERR_INVALID_AMOUNT)) ;; Max 50% reserve
+    (asserts! (has-role tx-sender ROLE_ADMIN) (err ERR_UNAUTHORIZED))
+    (var-set emergency-reserve-ratio ratio)
+    (ok true)
   )
 )
 
@@ -223,12 +314,20 @@
           vault-type: vault-type
         }
       )
+      ;; Initialize vault reserves
+      (map-set vault-reserves
+        { vault-id: vault-id }
+        {
+          allocated-reserves: u0,
+          pending-yields: u0
+        }
+      )
       (ok vault-id)
     )
   )
 )
 
-;; Enhanced deposit with comprehensive input validation
+;; Enhanced deposit with comprehensive input validation and reserve management
 (define-public (deposit (vault-id uint) (amount uint))
   (begin
     ;; Input validation
@@ -274,6 +373,8 @@
                   vault-type: (get vault-type vault-data)
                 }
               )
+              ;; Update reserve tracking
+              (update-vault-reserves validated-vault-id validated-amount)
               (ok true)
             )
             error (err ERR_TRANSFER_FAILED)
@@ -285,7 +386,7 @@
   )
 )
 
-;; Fixed withdraw function with comprehensive input validation
+;; FIXED withdraw function with proper fund management and queue system
 (define-public (withdraw (vault-id uint))
   (begin
     (asserts! (is-valid-vault-id vault-id) (err ERR_VAULT_NOT_FOUND))
@@ -305,27 +406,88 @@
             (let ((amount (get amount deposit-data))
                   (yield (calculate-yield validated-vault-id amount))
                   (total (+ amount yield)))
-              ;; Check contract has sufficient balance
-              (asserts! (>= (stx-get-balance (as-contract tx-sender)) total) (err ERR_INSUFFICIENT_BALANCE))
-              ;; Delete deposit record first
-              (map-delete deposits { user: tx-sender, vault-id: validated-vault-id })
-              ;; Update vault totals
-              (map-set vaults
-                { id: validated-vault-id }
-                {
-                  total-deposit: (- (get total-deposit vault-data) amount),
-                  total-yield: (get total-yield vault-data),
-                  lock-period: (get lock-period vault-data),
-                  vault-type: (get vault-type vault-data)
-                }
+              ;; Check if we can process withdrawal immediately or need to queue
+              (if (check-fund-sufficiency total)
+                ;; Process withdrawal immediately
+                (begin
+                  ;; Delete deposit record first
+                  (map-delete deposits { user: tx-sender, vault-id: validated-vault-id })
+                  ;; Update vault totals
+                  (map-set vaults
+                    { id: validated-vault-id }
+                    {
+                      total-deposit: (- (get total-deposit vault-data) amount),
+                      total-yield: (get total-yield vault-data),
+                      lock-period: (get lock-period vault-data),
+                      vault-type: (get vault-type vault-data)
+                    }
+                  )
+                  ;; Update reserve tracking
+                  (let ((current-reserves (default-to { allocated-reserves: u0, pending-yields: u0 }
+                                                      (map-get? vault-reserves { vault-id: validated-vault-id }))))
+                    (map-set vault-reserves
+                      { vault-id: validated-vault-id }
+                      {
+                        allocated-reserves: (if (>= (get allocated-reserves current-reserves) yield)
+                                               (- (get allocated-reserves current-reserves) yield)
+                                               u0),
+                        pending-yields: (if (>= (get pending-yields current-reserves) yield)
+                                          (- (get pending-yields current-reserves) yield)
+                                          u0)
+                      }
+                    )
+                    (var-set total-pending-yields (if (>= (var-get total-pending-yields) yield)
+                                                     (- (var-get total-pending-yields) yield)
+                                                     u0))
+                  )
+                  ;; FIXED: Transfer from contract to user (correct addresses)
+                  (as-contract (stx-transfer? total tx-sender tx-sender))
+                )
+                ;; Queue withdrawal if insufficient immediate funds
+                (begin
+                  (asserts! (< (var-get withdrawal-queue-count) MAX_WITHDRAWAL_QUEUE) (err ERR_WITHDRAWAL_QUEUE_FULL))
+                  (map-set withdrawal-queue
+                    { user: tx-sender, vault-id: validated-vault-id }
+                    {
+                      amount: amount,
+                      yield: yield,
+                      total: total,
+                      queued-block: current-block
+                    }
+                  )
+                  (var-set withdrawal-queue-count (+ (var-get withdrawal-queue-count) u1))
+                  (ok true)
+                )
               )
-              ;; Transfer from contract to user (FIXED)
-              (as-contract (stx-transfer? total tx-sender tx-sender))
             )
           )
           (err ERR_VAULT_NOT_FOUND)
         )
         (err ERR_INSUFFICIENT_BALANCE)
+      )
+    )
+  )
+)
+
+;; Process queued withdrawals (admin function)
+(define-public (process-withdrawal-queue (user principal) (vault-id uint))
+  (begin
+    (asserts! (has-role tx-sender ROLE_ADMIN) (err ERR_UNAUTHORIZED))
+    (asserts! (is-valid-principal user) (err ERR_INVALID_PRINCIPAL))
+    (asserts! (is-valid-vault-id vault-id) (err ERR_VAULT_NOT_FOUND))
+    (let ((validated-vault-id (sanitize-vault-id vault-id))
+          (queued-withdrawal (map-get? withdrawal-queue { user: user, vault-id: validated-vault-id })))
+      (match queued-withdrawal
+        withdrawal-data
+        (let ((total (get total withdrawal-data)))
+          (asserts! (check-fund-sufficiency total) (err ERR_INSUFFICIENT_BALANCE))
+          ;; Remove from queue
+          (map-delete withdrawal-queue { user: user, vault-id: validated-vault-id })
+          (var-set withdrawal-queue-count (- (var-get withdrawal-queue-count) u1))
+          ;; Process the withdrawal
+          (as-contract (stx-transfer? total tx-sender user))
+        )
+        (err ERR_VAULT_NOT_FOUND)
       )
     )
   )
@@ -535,4 +697,59 @@
     is-paused: (var-get contract-paused),
     current-block: stacks-block-height
   })
+)
+
+;; === New Fund Management Read-Only Functions ===
+
+;; Get fund management status
+(define-read-only (get-fund-status)
+  (ok {
+    total-yield-reserves: (var-get total-yield-reserves),
+    total-pending-yields: (var-get total-pending-yields),
+    withdrawal-queue-count: (var-get withdrawal-queue-count),
+    emergency-reserve-ratio: (var-get emergency-reserve-ratio),
+    available-for-withdrawal: (let ((balance (stx-get-balance (as-contract tx-sender)))
+                                   (pending (var-get total-pending-yields))
+                                   (emergency-reserve (/ (* balance (var-get emergency-reserve-ratio)) u100)))
+                                (if (>= balance (+ pending emergency-reserve))
+                                    (- balance (+ pending emergency-reserve))
+                                    u0))
+  })
+)
+
+;; Get vault reserves
+(define-read-only (get-vault-reserves (vault-id uint))
+  (if (is-valid-vault-id vault-id)
+    (let ((validated-vault-id (sanitize-vault-id vault-id)))
+      (match (map-get? vault-reserves { vault-id: validated-vault-id })
+        reserves (ok reserves)
+        (ok { allocated-reserves: u0, pending-yields: u0 })
+      )
+    )
+    (err ERR_VAULT_NOT_FOUND)
+  )
+)
+
+;; Get queued withdrawal
+(define-read-only (get-queued-withdrawal (user principal) (vault-id uint))
+  (if (and (is-valid-principal user) (is-valid-vault-id vault-id))
+    (let ((validated-vault-id (sanitize-vault-id vault-id)))
+      (match (map-get? withdrawal-queue { user: user, vault-id: validated-vault-id })
+        withdrawal-data (ok withdrawal-data)
+        (err ERR_VAULT_NOT_FOUND)
+      )
+    )
+    (err ERR_INVALID_PRINCIPAL)
+  )
+)
+
+;; Check if withdrawal can be processed immediately
+(define-read-only (can-process-withdrawal-immediately (vault-id uint) (amount uint))
+  (if (and (is-valid-vault-id vault-id) (is-valid-amount amount))
+    (let ((yield (calculate-yield vault-id amount))
+          (total (+ amount yield)))
+      (ok (check-fund-sufficiency total))
+    )
+    (err ERR_INVALID_AMOUNT)
+  )
 )
