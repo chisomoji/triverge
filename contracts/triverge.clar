@@ -278,10 +278,11 @@
     (asserts! (has-role tx-sender ROLE_ADMIN) (err ERR_UNAUTHORIZED))
     (let ((validated-amount (sanitize-amount amount))
           (contract-balance (stx-get-balance (as-contract tx-sender)))
-          (required-reserves (var-get total-pending-yields)))
+          (required-reserves (var-get total-pending-yields))
+          (admin-sender tx-sender))
       ;; Ensure we don't withdraw funds needed for user yields
       (asserts! (>= (- contract-balance validated-amount) required-reserves) (err ERR_INSUFFICIENT_YIELD_RESERVES))
-      (as-contract (stx-transfer? validated-amount tx-sender tx-sender))
+      (as-contract (stx-transfer? validated-amount tx-sender admin-sender))
     )
   )
 )
@@ -440,8 +441,10 @@
                                                      (- (var-get total-pending-yields) yield)
                                                      u0))
                   )
-                  ;; FIXED: Transfer from contract to user (correct addresses)
-                  (as-contract (stx-transfer? total tx-sender tx-sender))
+                  ;; Transfer from contract to user
+                  (let ((recipient tx-sender))
+                    (as-contract (stx-transfer? total tx-sender recipient))
+                  )
                 )
                 ;; Queue withdrawal if insufficient immediate funds
                 (begin
@@ -749,7 +752,4 @@
     (let ((yield (calculate-yield vault-id amount))
           (total (+ amount yield)))
       (ok (check-fund-sufficiency total))
-    )
-    (err ERR_INVALID_AMOUNT)
-  )
-)
+ 
